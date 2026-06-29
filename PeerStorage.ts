@@ -9,6 +9,7 @@ import { scheduleOnceIfDuplicated } from "octagonal-wheels/concurrency/lock";
 import { DispatchFun, Peer, PeerHealth } from "./Peer.ts";
 import chokidar from "chokidar";
 import { walk } from 'fs/walk';
+import { minimatch } from "minimatch";
 
 import { scheduleTask } from "octagonal-wheels/concurrency/task";
 
@@ -18,6 +19,16 @@ export class PeerStorage extends Peer {
 
     constructor(conf: PeerStorageConf, dispatcher: DispatchFun) {
         super(conf, dispatcher);
+    }
+
+    shouldIgnore(path: string): boolean {
+        if (!this.config.ignore || this.config.ignore.length === 0) return false;
+        for (const pattern of this.config.ignore) {
+            if (minimatch(path, pattern, { dot: true })) {
+                return true;
+            }
+        }
+        return false;
     }
 
     async delete(pathSrc: string): Promise<boolean> {
@@ -157,6 +168,10 @@ export class PeerStorage extends Peer {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
 
+        if (this.shouldIgnore(path)) {
+            return;
+        }
+
         const data = await this.get(path);
 
         if (data === false) return;
@@ -177,6 +192,11 @@ export class PeerStorage extends Peer {
     async dispatchDeleted(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
+
+        if (this.shouldIgnore(path)) {
+            return;
+        }
+
         await scheduleOnceIfDuplicated(pathSrc, async () => {
             await delay(250);
             if (!await this.isRepeating(path, false)) {
@@ -257,9 +277,16 @@ export class PeerStorage extends Peer {
         const lP = this.toStoragePath(this.toLocalPath("."));
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
         if (this.config.scanOfflineChanges) {
-            for await (const entry of walk(lP)) {
+            const ignorePatterns = this.config.ignore ?? [];
+            const skipRegexps = ignorePatterns.map(p => {
+                const escaped = lP.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const pattern = p.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
+                return new RegExp(`${escaped}/${pattern}`);
+            });
+            for await (const entry of walk(lP, { skip: skipRegexps })) {
                 if (entry.isFile) {
                     const ePath = this.toPosixPath(relative(this.toLocalPath("."), entry.path));
+                    if (this.shouldIgnore(ePath)) continue;
                     if (await this.isChanged(ePath)) {
                         this.debugLog(`Offline changes detected: ${ePath}`);
                         await this.dispatch(entry.path);
